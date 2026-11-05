@@ -245,9 +245,24 @@ if [ "$OPERATION" = add ]; then check_mapping "$CONNECTOR:edid/$EDID_NAME"; fi
 check_mkinitcpio_dropins
 mkdir -p -- "${BOOT_LOCK%/*}"
 exec 201>"$BOOT_LOCK"; flock --timeout=30 201 || die "Another boot operation is running"
-(set -o noclobber; printf 'drmcru-%s' "$$" > "$PACKAGE_LOCK") 2>/dev/null || die "A package transaction is running"
+# A drmcru run killed outright (SIGKILL, power loss) cannot release the
+# package lock. Reclaim it only when it names a drmcru process that is gone.
+if [ -f "$PACKAGE_LOCK" ] && [ ! -L "$PACKAGE_LOCK" ]; then
+    lock_owner="$(head -c 64 -- "$PACKAGE_LOCK" 2>/dev/null || true)"
+    if [[ "$lock_owner" =~ ^drmcru-([0-9]+)$ ]] && [ ! -e "/proc/${BASH_REMATCH[1]}" ]; then
+        echo "[WARN] Removing stale package lock left by an interrupted drmcru run" >&2
+        rm -f -- "$PACKAGE_LOCK"
+    fi
+fi
+(set -o noclobber; printf 'drmcru-%s' "$$" > "$PACKAGE_LOCK") 2>/dev/null \
+    || die "A package transaction is running (if none is, remove $PACKAGE_LOCK)"
 PACKAGE_LOCK_OWNED=1
 TX="$(mktemp -d "$TRANSACTION_ROOT/drmcru-boot.XXXXXXXX")"; chmod 700 "$TX"
+# The rollback snapshot is a full copy of the boot partition.
+boot_used="$(du -sxB1 -- "$BOOT_ROOT" | cut -f1)"
+snapshot_available="$(df -B1 --output=avail "$TX" | tail -n1 | tr -d ' ')"
+[ "$snapshot_available" -ge $((boot_used + 67108864)) ] \
+    || die "Not enough space in $TRANSACTION_ROOT for a $((boot_used / 1048576)) MiB rollback copy of $BOOT_ROOT"
 mkdir -- "$TX/boot"
 cp -a -- "$BOOT_ROOT/." "$TX/boot/"
 diff -qr --no-dereference -- "$TX/boot" "$BOOT_ROOT" >/dev/null

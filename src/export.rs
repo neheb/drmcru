@@ -19,6 +19,35 @@ pub enum ExportError {
     Write { path: PathBuf, source: io::Error },
 }
 
+/// Directory for exported EDIDs: `$XDG_DATA_HOME/drmcru`, falling back to
+/// `~/.local/share/drmcru`, then to the current directory.
+pub fn default_output_dir() -> io::Result<PathBuf> {
+    let dir = match output_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME")) {
+        Some(dir) => dir,
+        None => return std::env::current_dir(),
+    };
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn output_dir_from(
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    // The XDG spec says relative values must be ignored.
+    let absolute = |value: std::ffi::OsString| {
+        let path = PathBuf::from(value);
+        path.is_absolute().then_some(path)
+    };
+    xdg_data_home
+        .and_then(absolute)
+        .or_else(|| {
+            home.and_then(absolute)
+                .map(|home| home.join(".local/share"))
+        })
+        .map(|base| base.join("drmcru"))
+}
+
 pub fn export_workspace_edid(
     monitor: &Monitor,
     workspace: &EdidWorkspace,
@@ -171,6 +200,25 @@ fn write_instructions(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_dir_prefers_absolute_xdg_data_home() {
+        use super::output_dir_from;
+        use std::path::PathBuf;
+        assert_eq!(
+            output_dir_from(Some("/data".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/data/drmcru"))
+        );
+        assert_eq!(
+            output_dir_from(Some("relative".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.local/share/drmcru"))
+        );
+        assert_eq!(
+            output_dir_from(Some("".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.local/share/drmcru"))
+        );
+        assert_eq!(output_dir_from(None, None), None);
+    }
+
     use super::*;
     use crate::models::{ConnectorStatus, HyprlandMonitor, TimingDescriptor};
 

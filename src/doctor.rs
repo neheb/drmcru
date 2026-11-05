@@ -23,6 +23,15 @@ pub fn run() -> Result<()> {
         "{}",
         report_text(&monitors, &support, &overrides, &hyprland_version)
     );
+    let lock = std::path::Path::new(install::PACKAGE_LOCK);
+    if let Some(pid) = install::stale_drmcru_package_lock(lock, std::path::Path::new("/proc")) {
+        println!(
+            "\nWarning: {} was left by an interrupted drmcru run (PID {pid}).\n\
+             pacman cannot run until it is removed: sudo rm {}",
+            lock.display(),
+            lock.display()
+        );
+    }
     Ok(())
 }
 

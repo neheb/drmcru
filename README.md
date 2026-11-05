@@ -95,8 +95,9 @@ reading or changing a real monitor.
 `Switch` only selects modes already exposed by DRM/Hyprland. It does not make a
 new EDID mode appear.
 
-Export writes the current working EDID. With no pending changes, it asks you to
-make an edit before writing any files. VRR edits and stereo cleanup also count
+Export writes the current working EDID and manual instructions to
+`$XDG_DATA_HOME/drmcru/` (normally `~/.local/share/drmcru/`). With no pending
+changes, it asks you to make an edit before writing any files. VRR edits and stereo cleanup also count
 as pending changes.
 
 ## What It Can Edit
@@ -203,6 +204,10 @@ space for staged images, a complete boot backup and the retained recovery entry.
   Export still produces the EDID plus distribution-neutral manual instructions.
 - Run the TUI in an interactive terminal (80×24 or larger is recommended). For
   scripts, redirected output, or support logs, use `drmcru doctor` instead.
+- If pacman reports `unable to lock database` after an Install/Update was
+  interrupted by a crash or power loss, `drmcru doctor` says whether the lock
+  was left by drmcru. The next Install/Update reclaims it automatically, or run
+  `sudo rm /var/lib/pacman/db.lck` once no package manager is running.
 - If `pkexec` is installed but no authentication prompt appears, make sure a
   polkit authentication agent is running in the desktop session.
 - Internal eDP panels often cannot scale arbitrary smaller scanouts. Prefer the

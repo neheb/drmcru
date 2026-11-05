@@ -1094,3 +1094,70 @@ fn preview_summary_has_all_targets() {
     assert!(lines[7].contains("drm.edid_firmware"));
     assert!(lines[8].contains("verify"));
 }
+
+#[test]
+fn a_stale_drmcru_package_lock_is_reclaimed() {
+    let fixture = ScriptFixture::new();
+    // Above the kernel's maximum PID, so no such process can exist.
+    fs::write(fixture.dir.join("locks/package.lock"), "drmcru-999999999").unwrap();
+    let output = fixture.run(false);
+    success(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Removing stale package lock"));
+    assert!(!fixture.dir.join("locks/package.lock").exists());
+}
+
+#[test]
+fn a_package_manager_lock_is_respected() {
+    for owner in ["", "drmcru-1"] {
+        let fixture = ScriptFixture::new();
+        let before = fixture.boot();
+        fs::write(fixture.dir.join("locks/package.lock"), owner).unwrap();
+        let output = fixture.run(false);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("A package transaction is running"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(fixture.dir.join("locks/package.lock")).unwrap(),
+            owner.as_bytes()
+        );
+        assert_eq!(fixture.boot(), before);
+    }
+}
+
+#[test]
+fn insufficient_snapshot_space_stops_before_changes() {
+    let fixture = ScriptFixture::new();
+    let before = fixture.boot();
+    fixture.command("df", "echo Avail; echo 0");
+    let output = fixture.run(false);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("rollback copy"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.boot(), before);
+    assert!(!fixture.firmware().exists());
+    assert!(!fixture.dir.join("locks/package.lock").exists());
+}
+
+#[test]
+fn stale_lock_detection_only_matches_dead_drmcru_owners() {
+    let dir = unique_test_dir();
+    let proc_root = dir.join("proc");
+    fs::create_dir_all(proc_root.join("42")).unwrap();
+    let lock = dir.join("db.lck");
+    assert_eq!(stale_drmcru_package_lock(&lock, &proc_root), None);
+    fs::write(&lock, "").unwrap();
+    assert_eq!(stale_drmcru_package_lock(&lock, &proc_root), None);
+    fs::write(&lock, "drmcru-42").unwrap();
+    assert_eq!(stale_drmcru_package_lock(&lock, &proc_root), None);
+    fs::write(&lock, "drmcru-43").unwrap();
+    assert_eq!(stale_drmcru_package_lock(&lock, &proc_root), Some(43));
+    fs::write(&lock, "drmcru-43x").unwrap();
+    assert_eq!(stale_drmcru_package_lock(&lock, &proc_root), None);
+    let _ = fs::remove_dir_all(&dir);
+}

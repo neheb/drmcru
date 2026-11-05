@@ -823,7 +823,7 @@ LIMINE_VENDOR_DIR="/usr/share/limine-entry-tool.d"
 LIMINE_FUNCTIONS="/usr/lib/limine/limine-common-functions"
 BOOT_HOOKS="/etc/boot/hooks"
 BOOT_LOCK="/run/lock/boot-partition.lock"
-PACKAGE_LOCK="/var/lib/pacman/db.lck"
+PACKAGE_LOCK="{PACKAGE_LOCK}"
 TRANSACTION_ROOT="/var/tmp"
 MODULES_ROOT="/usr/lib/modules"
 MACHINE_ID_FILE="/etc/machine-id"
@@ -840,6 +840,21 @@ ENTRY_AWK={entry_awk}
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// pacman's lock file, which the privileged transaction holds while it runs.
+pub const PACKAGE_LOCK: &str = "/var/lib/pacman/db.lck";
+
+/// Returns the PID recorded in a package lock left behind by a drmcru run
+/// that no longer exists. Locks held by pacman or a live process are ignored.
+pub fn stale_drmcru_package_lock(lock: &Path, proc_root: &Path) -> Option<u32> {
+    let metadata = fs::symlink_metadata(lock).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > 64 {
+        return None;
+    }
+    let contents = fs::read_to_string(lock).ok()?;
+    let pid: u32 = contents.strip_prefix("drmcru-")?.parse().ok()?;
+    (!proc_root.join(pid.to_string()).exists()).then_some(pid)
 }
 
 /// Run the install. Returns a report on success, or an error.

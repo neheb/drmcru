@@ -1031,9 +1031,12 @@ impl App {
             return;
         };
 
-        let Ok(output_dir) = std::env::current_dir() else {
-            self.status = "Could not determine current output directory.".to_string();
-            return;
+        let output_dir = match crate::export::default_output_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                self.status = format!("Could not create the export directory: {error}");
+                return;
+            }
         };
 
         let Some(workspace) = self
@@ -1482,9 +1485,12 @@ impl App {
             SystemOperation::Install
         };
 
-        let Ok(output_dir) = std::env::current_dir() else {
-            self.status = "Could not determine current output directory.".to_string();
-            return;
+        let output_dir = match crate::export::default_output_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                self.status = format!("Could not create the export directory: {error}");
+                return;
+            }
         };
         let Some(workspace) = self
             .selected_workspace()
