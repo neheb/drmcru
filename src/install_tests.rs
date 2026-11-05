@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::os::unix::fs::symlink;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MACHINE: &str = "00000000000000000000000000000000";
 const BASE_ARGS: &str = "root=UUID=test cryptdevice=UUID=crypt:root quiet";
@@ -150,7 +151,8 @@ else : > "$target"; fi
                 kernel_parameter: plan.kernel_parameter,
             })
         } else {
-            build_install_script(&plan)
+            let edid = fs::read(&plan.edid_source).unwrap();
+            build_install_script(&plan, &edid)
         };
         for (variable, original, relative) in [
             ("MKINITCPIO_BIN", "/usr/bin/mkinitcpio", "bin/mkinitcpio"),
@@ -213,8 +215,12 @@ else : > "$target"; fi
                 ),
             );
         }
-        Command::new("bash")
-            .args(["-c", &script])
+        // Feed the script on stdin exactly like the pkexec path does.
+        let mut child = Command::new("bash")
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .env("TEST_ROOT", &self.dir)
             .env("TEST_UKI", "no")
             .env("TEST_FALLBACK", "no")
@@ -228,8 +234,15 @@ else : > "$target"; fi
                     std::env::var("PATH").unwrap()
                 ),
             )
-            .output()
-            .unwrap()
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, script.as_bytes());
+        });
+        let output = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        output
     }
     fn firmware(&self) -> PathBuf {
         self.dir.join("firmware-root/edid/drmcru_custom_DP-1.bin")
@@ -881,7 +894,10 @@ fn mapping_detection_handles_consolidated_kernel_parameter() {
 
 #[test]
 fn generated_privileged_scripts_are_bash_parseable() {
-    assert_bash_n(&build_install_script(&sample_plan()));
+    assert_bash_n(&build_install_script(
+        &sample_plan(),
+        &[0, 0xff, b'\'', b'%'],
+    ));
     assert_bash_n(&build_uninstall_script(&sample_uninstall_plan()));
 }
 
@@ -1093,4 +1109,57 @@ fn preview_summary_has_all_targets() {
     assert!(lines[6].contains("/etc/default/limine"));
     assert!(lines[7].contains("drm.edid_firmware"));
     assert!(lines[8].contains("verify"));
+}
+
+#[test]
+fn embedded_edid_bytes_are_installed_exactly() {
+    let fixture = ScriptFixture::new();
+    let edid: Vec<u8> = (0..=255u8).chain(0..=255u8).collect();
+    fs::write(fixture.dir.join("source.bin"), &edid).unwrap();
+    success(&fixture.run(false));
+    assert_eq!(fs::read(fixture.firmware()).unwrap(), edid);
+}
+
+#[test]
+fn hooks_reading_stdin_cannot_consume_the_privileged_script() {
+    let fixture = ScriptFixture::new();
+    let hook = fixture.dir.join("hooks/pre.d/drain");
+    fs::write(&hook, "#!/bin/bash\ncat > \"$TEST_ROOT/drained\"\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    success(&fixture.run(false));
+    assert_eq!(fs::read(fixture.dir.join("drained")).unwrap(), b"");
+    assert_eq!(fs::read(fixture.firmware()).unwrap(), b"new-edid");
+}
+
+#[test]
+fn edid_validation_requires_whole_blocks_and_header() {
+    let mut edid = vec![0u8; 256];
+    edid[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+    assert!(validate_edid_bytes(&edid).is_ok());
+    assert!(validate_edid_bytes(&edid[..200]).is_err());
+    assert!(validate_edid_bytes(&[]).is_err());
+    assert!(validate_edid_bytes(&[0u8; 128]).is_err());
+    assert!(validate_edid_bytes(&vec![0u8; MAX_EDID_LEN + 128]).is_err());
+}
+
+#[test]
+fn edid_source_symlinks_are_refused() {
+    let dir = unique_test_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let mut edid = vec![0u8; 128];
+    edid[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+    let real = dir.join("real.bin");
+    fs::write(&real, &edid).unwrap();
+    let link = dir.join("link.bin");
+    symlink(&real, &link).unwrap();
+    assert_eq!(read_edid_source(&real).unwrap(), edid);
+    assert!(matches!(
+        read_edid_source(&link),
+        Err(InstallError::InvalidEdid { .. })
+    ));
+    assert!(matches!(
+        read_edid_source(&dir.join("missing.bin")),
+        Err(InstallError::MissingEdid(_))
+    ));
+    let _ = fs::remove_dir_all(&dir);
 }

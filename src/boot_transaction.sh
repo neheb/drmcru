@@ -206,7 +206,7 @@ done
 [ -f "$MKINIT" ] && [ ! -L "$MKINIT" ] || die "/etc/mkinitcpio.conf not found or not a regular file"
 [ -f "$LIMINE" ] && [ ! -L "$LIMINE" ] || die "/boot/limine.conf not found or not a regular file"
 grep -qE '^[[:space:]]*cmdline:' "$LIMINE" || die "/boot/limine.conf has no cmdline entries"
-[ "$OPERATION" != add ] || [ -s "$EDID_SOURCE" ] || die "EDID source does not exist: $EDID_SOURCE"
+[ "$OPERATION" != add ] || [ "$EDID_SIZE" -gt 0 ] || die "No EDID data was supplied"
 [ -f "$LIMINE_FUNCTIONS" ] || die "Limine entry-tool integration is unavailable"
 for directory in "$MKINIT_DROPIN_DIR" "$LIMINE_DROPIN_DIR" "${LIMINE_DEFAULT_CONFIG%/*}" "${FIRMWARE_TARGET%/*}"; do
     [ ! -L "$directory" ] || die "Managed directory is a symlink: $directory"
@@ -378,7 +378,11 @@ for key in "${KEYS[@]}"; do
     current="$(cmdline "$key")"
     [ "$(canonical "$current")" = "${EXPECTED_CMDLINES[$key]}" ] || die "A higher-priority Limine setting overrides $key; use Export"
 done
-if [ "$OPERATION" = add ]; then install -D -m 0644 -- "$EDID_SOURCE" "$FIRMWARE_TARGET";
+if [ "$OPERATION" = add ]; then
+    # The EDID travels inside this root-owned script; never read user paths.
+    printf '%b' "$EDID_DATA" > "$TX/edid.bin"
+    [ "$(stat -c %s "$TX/edid.bin")" -eq "$EDID_SIZE" ] || die "Embedded EDID data is corrupt"
+    install -D -m 0644 -- "$TX/edid.bin" "$FIRMWARE_TARGET"
 elif [ "$KEEP_FIRMWARE" -eq 0 ]; then rm -f -- "$FIRMWARE_TARGET"; fi
 if [ "$OPERATION" = remove ] && [ "$KEEP_FIRMWARE" -eq 0 ]; then update_mkinitcpio_dropin remove; fi
 remove_legacy_mkinitcpio_entry

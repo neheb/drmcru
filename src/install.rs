@@ -1,9 +1,8 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
 use thiserror::Error;
 
 const MKINITCPIO_DROPIN: &str = "/etc/mkinitcpio.conf.d/20-drmcru.conf";
@@ -366,6 +365,8 @@ pub struct InstallReport {
 pub enum InstallError {
     #[error("EDID source file does not exist: {0}")]
     MissingEdid(PathBuf),
+    #[error("EDID source {path} is not usable: {reason}")]
+    InvalidEdid { path: PathBuf, reason: String },
     #[error("unsafe firmware file name: {0}")]
     UnsafeFirmwareName(String),
     #[error("failed to write privileged script: {0}")]
@@ -771,39 +772,41 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 /// Generate the shared, verified boot transaction for either operation.
-pub fn build_install_script(plan: &InstallPlan) -> String {
-    build_override_script(
-        &plan.connector,
-        &plan.edid_file_name,
-        Some(&plan.edid_source),
-    )
+/// Build the privileged install script. The EDID bytes are embedded in the
+/// script so root never opens a path the unprivileged user controls.
+pub fn build_install_script(plan: &InstallPlan, edid: &[u8]) -> String {
+    build_override_script(&plan.connector, &plan.edid_file_name, Some(edid))
 }
 
 pub fn build_uninstall_script(plan: &UninstallPlan) -> String {
     build_override_script(&plan.connector, &plan.edid_file_name, None)
 }
 
-fn build_override_script(connector: &str, name: &str, source: Option<&Path>) -> String {
+fn build_override_script(connector: &str, name: &str, edid: Option<&[u8]>) -> String {
     let connector = shell_quote(connector);
     let name = shell_quote(name);
-    let operation = if source.is_some() { "add" } else { "remove" };
-    let source = shell_quote(
-        &source
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-    );
+    let operation = if edid.is_some() { "add" } else { "remove" };
+    let edid = edid.unwrap_or_default();
+    let edid_size = edid.len();
+    // printf %b escapes; only [0-9a-f\\x] characters, so no quoting issues.
+    let edid_data: String = edid.iter().map(|byte| format!("\\x{byte:02x}")).collect();
     let files_awk = shell_quote(include_str!("mkinitcpio_files.awk"));
     let preset_awk = shell_quote(include_str!("mkinitcpio_preset_config.awk"));
     let cmdline_awk = shell_quote(include_str!("kernel_cmdline.awk"));
     let entry_awk = shell_quote(include_str!("limine_entry.awk"));
     let mkinit_helpers = include_str!("mkinitcpio_dropin.sh");
     let transaction = include_str!("boot_transaction.sh");
+    // The script is fed to `bash -s` on stdin. Wrapping it in one brace group
+    // makes bash parse all of it before running anything, and the group's
+    // /dev/null stdin stops child commands from consuming script text.
     format!(
         r##"#!/bin/bash
+{{
 OPERATION={operation}
 CONNECTOR={connector}
 EDID_NAME={name}
-EDID_SOURCE={source}
+EDID_DATA='{edid_data}'
+EDID_SIZE={edid_size}
 MKINITCPIO_BIN="/usr/bin/mkinitcpio"
 LSINITCPIO_BIN="/usr/bin/lsinitcpio"
 ENTRY_TOOL_BIN="/usr/bin/limine-entry-tool"
@@ -834,8 +837,62 @@ CMDLINE_AWK={cmdline_awk}
 ENTRY_AWK={entry_awk}
 {mkinit_helpers}
 {transaction}
+}} </dev/null
+exit $?
 "##
     )
+}
+
+/// Read and sanity-check the exported EDID without following symlinks.
+fn read_edid_source(path: &Path) -> Result<Vec<u8>, InstallError> {
+    let invalid = |reason: String| InstallError::InvalidEdid {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            InstallError::MissingEdid(path.to_path_buf())
+        } else {
+            invalid(error.to_string())
+        }
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid("not a regular file".into()));
+    }
+    let mut file = fs::File::open(path).map_err(|error| invalid(error.to_string()))?;
+    // Reject a path swapped for a symlink or another file after the lstat.
+    let opened = file
+        .metadata()
+        .map_err(|error| invalid(error.to_string()))?;
+    if !opened.file_type().is_file()
+        || opened.dev() != metadata.dev()
+        || opened.ino() != metadata.ino()
+    {
+        return Err(invalid("file changed while it was being opened".into()));
+    }
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(
+        &mut io::Read::take(&mut file, MAX_EDID_LEN as u64 + 1),
+        &mut bytes,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    validate_edid_bytes(&bytes).map_err(invalid)?;
+    Ok(bytes)
+}
+
+const MAX_EDID_LEN: usize = 256 * 128;
+
+fn validate_edid_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(128) || bytes.len() > MAX_EDID_LEN {
+        return Err(format!(
+            "size {} is not a whole number of 128-byte EDID blocks",
+            bytes.len()
+        ));
+    }
+    if bytes[..8] != [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00] {
+        return Err("missing EDID header".into());
+    }
+    Ok(())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -864,17 +921,14 @@ pub fn install(plan: &InstallPlan) -> Result<InstallReport, InstallError> {
     validate_connector_mapping(&plan.connector, connectors)
         .map_err(InstallError::UnsupportedSystem)?;
 
-    // Validate source exists
-    if !plan.edid_source.exists() {
-        return Err(InstallError::MissingEdid(plan.edid_source.clone()));
-    }
+    let edid = read_edid_source(&plan.edid_source)?;
 
     let support = inspect_system_support();
     if !support.is_supported() {
         return Err(InstallError::UnsupportedSystem(support.report_text()));
     }
 
-    run_privileged_script(&build_install_script(plan))
+    run_privileged_script(&build_install_script(plan, &edid))
 }
 
 /// Run the uninstall. Returns a report on success, or an error.
@@ -897,17 +951,25 @@ fn run_privileged_script(script: &str) -> Result<InstallReport, InstallError> {
         return Err(InstallError::NoPkexec);
     }
 
-    let script_path = write_temp_install_script(script)?;
-
-    // Run via pkexec
-    let result = Command::new("pkexec")
-        .arg("bash")
-        .arg(&script_path)
-        .output();
-
-    // Clean up even when pkexec cannot be launched.
-    let _ = std::fs::remove_file(&script_path);
-    let result = result.map_err(InstallError::Launch)?;
+    // Pass the script on stdin so no user-writable file sits between
+    // authentication and execution.
+    let mut child = Command::new("pkexec")
+        .args(["bash", "-s"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(InstallError::Launch)?;
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let script = script.to_owned();
+    // Write from a thread: pkexec reads nothing until authentication ends.
+    // A broken pipe means pkexec exited early; its status reports why.
+    let writer = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+    let result = child.wait_with_output().map_err(InstallError::Launch)?;
+    match writer.join() {
+        Ok(Err(error)) if result.status.success() => return Err(InstallError::ScriptWrite(error)),
+        _ => {}
+    }
 
     let stdout = String::from_utf8_lossy(&result.stdout).to_string();
     let stderr = String::from_utf8_lossy(&result.stderr).to_string();
@@ -966,42 +1028,6 @@ pub(crate) fn validate_connector_mapping<'a>(
         ));
     }
     Ok(())
-}
-
-fn write_temp_install_script(script: &str) -> Result<PathBuf, InstallError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    let mut last_error = None;
-
-    for attempt in 0..100 {
-        let path = std::env::temp_dir().join(format!("drmcru-install-{pid}-{now}-{attempt}.sh"));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o700)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(script.as_bytes())
-                    .map_err(InstallError::ScriptWrite)?;
-                return Ok(path);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                last_error = Some(error);
-            }
-            Err(error) => return Err(InstallError::ScriptWrite(error)),
-        }
-    }
-
-    Err(InstallError::ScriptWrite(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not create unique temporary install script",
-        )
-    })))
 }
 
 #[cfg(test)]
